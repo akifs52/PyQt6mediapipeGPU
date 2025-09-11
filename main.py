@@ -124,50 +124,97 @@ def tf_warp_image_with_homography(src_bgr: np.ndarray, H_inv: np.ndarray, out_si
 # =============================
 # Face swap (GPU warp + seamlessClone)
 # =============================
-def color_transfer(src, dst):
-    """Kaynak yüzün rengini hedef yüze benzetir (LAB color transfer + gamma)."""
-    src_lab = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype("float32")
-    dst_lab = cv2.cvtColor(dst, cv2.COLOR_BGR2LAB).astype("float32")
+def pyramid_blend(src, dst, mask, num_levels=4):
+    """Multi-band (pyramid) blending fallback."""
+    import cv2
+    import numpy as np
 
-    src_mean, src_std = cv2.meanStdDev(src_lab)
-    dst_mean, dst_std = cv2.meanStdDev(dst_lab)
+    mask_f = (mask.astype("float32") / 255.0)[..., None]
 
-    src_mean = src_mean.flatten()
-    src_std  = src_std.flatten()
-    dst_mean = dst_mean.flatten()
-    dst_std  = dst_std.flatten()
+    gp_mask = [mask_f]
+    gp_src = [src.astype("float32")]
+    gp_dst = [dst.astype("float32")]
+    for i in range(num_levels):
+        gp_mask.append(cv2.pyrDown(gp_mask[-1]))
+        gp_src.append(cv2.pyrDown(gp_src[-1]))
+        gp_dst.append(cv2.pyrDown(gp_dst[-1]))
 
-    adjusted = (src_lab - src_mean) * (dst_std / (src_std + 1e-6)) + dst_mean
-    adjusted = np.clip(adjusted, 0, 255).astype("uint8")
+    lp_src = []
+    lp_dst = []
+    for i in range(num_levels):
+        sz = (gp_src[i].shape[1], gp_src[i].shape[0])
+        GE = cv2.pyrUp(gp_src[i+1], dstsize=sz)
+        L = gp_src[i] - GE
+        lp_src.append(L)
 
-    # LAB → BGR
-    adjusted_bgr = cv2.cvtColor(adjusted, cv2.COLOR_LAB2BGR)
+        GE2 = cv2.pyrUp(gp_dst[i+1], dstsize=sz)
+        L2 = gp_dst[i] - GE2
+        lp_dst.append(L2)
 
-    # 🔹 Parlaklık/Gamma dengelemesi
-    src_gray = cv2.cvtColor(adjusted_bgr, cv2.COLOR_BGR2GRAY)
-    dst_gray = cv2.cvtColor(dst, cv2.COLOR_BGR2GRAY)
+    lp_src.append(gp_src[-1])
+    lp_dst.append(gp_dst[-1])
 
-    mean_src = np.mean(src_gray)
-    mean_dst = np.mean(dst_gray)
+    lp_res = []
+    for ls, ld, gm in zip(lp_src, lp_dst, gp_mask):
+        lp_res.append(ls * gm + ld * (1.0 - gm))
 
-    if mean_src > 1e-3:
-        gamma = mean_dst / mean_src
-        adjusted_bgr = np.clip((adjusted_bgr.astype("float32") * gamma), 0, 255).astype("uint8")
+    res = lp_res[-1]
+    for i in range(num_levels-1, -1, -1):
+        sz = (lp_res[i].shape[1], lp_res[i].shape[0])
+        res = cv2.pyrUp(res, dstsize=sz) + lp_res[i]
 
-    return adjusted_bgr
+    return np.clip(res, 0, 255).astype("uint8")
+
+
+def improved_color_transfer(src_region, dst_img, mask_region):
+    """LAB tabanlı renk eşleme + CLAHE (sadece mask içinde)."""
+    import cv2, numpy as np
+
+    ys, xs = np.where(mask_region == 255)
+    if len(xs) == 0:
+        return src_region
+    x0, x1 = np.min(xs), np.max(xs)
+    y0, y1 = np.min(ys), np.max(ys)
+
+    src_patch = src_region[y0:y1+1, x0:x1+1]
+    dst_patch = dst_img[y0:y1+1, x0:x1+1]
+    mask_patch = mask_region[y0:y1+1, x0:x1+1]
+
+    src_lab = cv2.cvtColor(src_patch, cv2.COLOR_BGR2LAB).astype("float32")
+    dst_lab = cv2.cvtColor(dst_patch, cv2.COLOR_BGR2LAB).astype("float32")
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    src_lab[:, :, 0] = clahe.apply(src_lab[:, :, 0].astype("uint8")).astype("float32")
+
+    eps = 1e-6
+    for c in range(3):
+        s_vals = src_lab[:, :, c][mask_patch == 255]
+        d_vals = dst_lab[:, :, c][mask_patch == 255]
+        if s_vals.size == 0 or d_vals.size == 0:
+            continue
+        s_mean, s_std = s_vals.mean(), s_vals.std()
+        d_mean, d_std = d_vals.mean(), d_vals.std()
+        src_lab[:, :, c] = (src_lab[:, :, c] - s_mean) * (d_std / (s_std + eps)) + d_mean
+
+    src_lab = np.clip(src_lab, 0, 255).astype("uint8")
+    src_corr = cv2.cvtColor(src_lab, cv2.COLOR_LAB2BGR)
+
+    out = src_region.copy()
+    out[y0:y1+1, x0:x1+1][mask_patch == 255] = src_corr[mask_patch == 255]
+    return out
 
 
 def face_swap(src_bgr: np.ndarray, dst_bgr: np.ndarray,
               src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
     """
-    Delaunay triangle-based face swap + renk eşleme + maske yumuşatma.
+    Delaunay triangle-based face swap + gelişmiş renk eşleme + maske yumuşatma.
+    Optimize edilmiş versiyon: mask3 repeat() kaldırıldı, cv2.bitwise_and + cv2.add kullanıldı.
     """
     try:
         h_dst, w_dst = dst_bgr.shape[:2]
-        src_pts_f = np.asarray(src_pts, dtype=np.float32).reshape(-1,2)
-        dst_pts_f = np.asarray(dst_pts, dtype=np.float32).reshape(-1,2)
+        src_pts_f = np.asarray(src_pts, dtype=np.float32).reshape(-1, 2)
+        dst_pts_f = np.asarray(dst_pts, dtype=np.float32).reshape(-1, 2)
 
-        # 1) Convex hull
         hull_index = cv2.convexHull(dst_pts_f.astype(np.int32), returnPoints=False).flatten()
         if hull_index.size == 0:
             print("Empty hull_index")
@@ -176,16 +223,15 @@ def face_swap(src_bgr: np.ndarray, dst_bgr: np.ndarray,
         dst_hull = dst_pts_f[hull_index]
         src_hull = src_pts_f[hull_index]
 
-        # 2) Delaunay triangulation
         rect = (0, 0, w_dst, h_dst)
         subdiv = cv2.Subdiv2D(rect)
-        for (x,y) in dst_pts_f:
+        for (x, y) in dst_pts_f:
             subdiv.insert((float(x), float(y)))
         triangleList = subdiv.getTriangleList()
 
         def find_index(pt):
-            x,y = pt
-            dists = np.linalg.norm(dst_pts_f - np.array([x,y]), axis=1)
+            x, y = pt
+            dists = np.linalg.norm(dst_pts_f - np.array([x, y]), axis=1)
             idx = int(np.argmin(dists))
             if dists[idx] > 2.0:
                 return -1
@@ -194,10 +240,11 @@ def face_swap(src_bgr: np.ndarray, dst_bgr: np.ndarray,
         warped_src = np.zeros_like(dst_bgr)
         mask_acc = np.zeros((h_dst, w_dst), dtype=np.uint8)
 
-        # 3) Warp her üçgeni
         for t in triangleList:
             pts = [(t[0], t[1]), (t[2], t[3]), (t[4], t[5])]
-            idx0 = find_index(pts[0]); idx1 = find_index(pts[1]); idx2 = find_index(pts[2])
+            idx0 = find_index(pts[0])
+            idx1 = find_index(pts[1])
+            idx2 = find_index(pts[2])
             if idx0 == -1 or idx1 == -1 or idx2 == -1:
                 continue
 
@@ -225,15 +272,16 @@ def face_swap(src_bgr: np.ndarray, dst_bgr: np.ndarray,
             mask = np.zeros((h_t_dst, w_t_dst), dtype=np.uint8)
             cv2.fillConvexPoly(mask, np.int32(t_dst_offset), 255)
 
-            warped_src[y_dst:y_dst+h_t_dst, x_dst:x_dst+w_t_dst][mask==255] = warped_patch[mask==255]
-            mask_acc[y_dst:y_dst+h_t_dst, x_dst:x_dst+w_t_dst][mask==255] = 255
+            roi = warped_src[y_dst:y_dst+h_t_dst, x_dst:x_dst+w_t_dst]
+            roi_mask = mask_acc[y_dst:y_dst+h_t_dst, x_dst:x_dst+w_t_dst]
+            roi[mask == 255] = warped_patch[mask == 255]
+            roi_mask[mask == 255] = 255
 
-        # 3b) Fallback: affine warp
         if np.count_nonzero(mask_acc) < 50:
             if len(hull_index) >= 3:
                 M, inliers = cv2.estimateAffinePartial2D(src_hull, dst_hull)
                 if M is not None:
-                    H = np.vstack([M, [0,0,1]]).astype(np.float32)
+                    H = np.vstack([M, [0, 0, 1]]).astype(np.float32)
                     H_inv = np.linalg.inv(H)
                     warped_src = tf_warp_image_with_homography(src_bgr, H_inv, (w_dst, h_dst))
                     mask_acc = np.zeros((h_dst, w_dst), dtype=np.uint8)
@@ -243,37 +291,54 @@ def face_swap(src_bgr: np.ndarray, dst_bgr: np.ndarray,
             else:
                 return dst_bgr
 
-       # 🔹 renk eşleme
-        warped_src = color_transfer(warped_src, dst_bgr)
+        # --- maske yumuşatma ---
+        face_area = max(1, int(np.sqrt(w_dst * h_dst) / 50))
+        k_erode = max(1, face_area // 2)
+        k_dilate = max(1, face_area)
+        kernel_e = np.ones((k_erode, k_erode), np.uint8)
+        kernel_d = np.ones((k_dilate, k_dilate), np.uint8)
+        mask_bin = cv2.erode(mask_acc, kernel_e, iterations=1)
+        mask_bin = cv2.dilate(mask_bin, kernel_d, iterations=1)
 
-        # 4) Maskeyi morfolojik olarak düzelt (keskin kenarlı)
-        mask_bin = mask_acc.copy()
-        kernel = np.ones((3,3), np.uint8)
-        mask_bin = cv2.erode(mask_bin, kernel, iterations=1)
-        mask_bin = cv2.dilate(mask_bin, kernel, iterations=2)
+        sigma = max(3, face_area * 1.5)
+        mask_blur = cv2.GaussianBlur(mask_bin, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        mask_blur = cv2.normalize(mask_blur, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-        # 5) Seamless clone / fallback alpha blend
+        # --- renk eşleme sadece mask içinde ---
+        warped_region = cv2.bitwise_and(warped_src, warped_src, mask=mask_acc)
+        warped_region = improved_color_transfer(warped_region, dst_bgr, mask_acc)
+
+        inv_mask = cv2.bitwise_not(mask_acc)
+        base_bg = cv2.bitwise_and(dst_bgr, dst_bgr, mask=inv_mask)
+        warped_src_full = cv2.add(base_bg, warped_region)
+
+        # --- seamlessClone dene ---
         hull_rect = cv2.boundingRect(np.int32(dst_hull))
         cx, cy, cw, ch = hull_rect
-        center = (cx + cw//2, cy + ch//2)
+        center = (cx + cw // 2, cy + ch // 2)
+        center = (np.clip(center[0], 0, w_dst-1), np.clip(center[1], 0, h_dst-1))
+
+        _, mask_blur = cv2.threshold(mask_blur, 10, 255, cv2.THRESH_BINARY)
+        mask_blur = mask_blur.astype(np.uint8)
+
+        output = None
         try:
-            output = cv2.seamlessClone(warped_src, dst_bgr, mask_bin, center, cv2.NORMAL_CLONE)
-        except Exception as e:
-            print("seamlessClone failed, fallback alpha blend:", e)
-            alpha = (mask_bin.astype(np.float32)/255.0)[...,None]
-            output = np.clip(
-                warped_src.astype(np.float32)*alpha +
-                dst_bgr.astype(np.float32)*(1-alpha), 0, 255
-            ).astype(np.uint8)
+            output = cv2.seamlessClone(warped_src_full, dst_bgr, mask_blur, center, cv2.MIXED_CLONE)
+        except Exception as e1:
+            try:
+                output = cv2.seamlessClone(warped_src_full, dst_bgr, mask_blur, center, cv2.NORMAL_CLONE)
+            except Exception as e2:
+                print("seamlessClone hata:", e1, e2)
+                output = None
+
+        if output is None:
+            output = pyramid_blend(warped_src_full, dst_bgr, mask_blur, num_levels=4)
 
         return output
 
     except Exception as ee:
         print("face_swap failed:", ee)
         return dst_bgr
-
-
-
 
 # =============================
 # CameraWorker
